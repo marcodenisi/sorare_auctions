@@ -1,4 +1,4 @@
 requests
 pyyaml
 pandas
-streamlit
+streamlit==1.54.0
