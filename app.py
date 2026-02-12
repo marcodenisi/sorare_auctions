@@ -105,4 +105,4 @@ for tab, (label, filename) in zip(tab_objects, TABS.items()):
         if df is None or df.empty:
             st.warning("No data. Run fetch_auctions.py first.")
         else:
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
