@@ -1,19 +1,15 @@
 gk:
   - slug: "roman-celentano"
     team: "CIN"
-    role: "Starter"
 
 df:
   - slug: "miles-robinson"
     team: "CIN"
-    role: "Starter"
 
 mf:
   - slug: "luciano-acosta"
     team: "CIN"
-    role: "Starter"
 
 fw:
   - slug: "denis-bouanga"
     team: "LAFC"
-    role: "Starter"

@@ -179,13 +179,12 @@ def main() -> None:
         if not players:
             continue
 
-        # Collect rows: each row is (display_name, team, role, [prices])
-        rows: list[tuple[str, str, str, list[float]]] = []
+        # Collect rows: each row is (display_name, team, [prices])
+        rows: list[tuple[str, str, list[float]]] = []
 
         for i, p in enumerate(players):
             slug = p["slug"]
             team = p["team"]
-            role = p["role"]
 
             # Sleep between players to respect rate limit
             if not (pos == POSITIONS[0] and i == 0):
@@ -196,24 +195,24 @@ def main() -> None:
             prices.reverse()  # oldest first: 1st = first auction chronologically
             print(f"{len(prices)} auctions found")
 
-            rows.append((display_name(slug, team), team, role, prices))
+            rows.append((display_name(slug, team), team, prices))
 
         # Determine max number of price columns across all players in group
-        max_prices = max((len(r[3]) for r in rows), default=0)
+        max_prices = max((len(r[2]) for r in rows), default=0)
 
         # Build header
-        header = ["player", "team", "role"]
+        header = ["player", "team"]
         header += [ordinal(n) for n in range(1, max_prices + 1)]
 
         csv_path = os.path.join(data_dir, f"limited_{pos}.csv")
         with open(csv_path, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(header)
-            for name, team, role, prices in rows:
+            for name, team, prices in rows:
                 price_strs = [f"{p:.2f}" for p in prices]
                 # Pad with empty strings if this player has fewer prices
                 price_strs += [""] * (max_prices - len(price_strs))
-                writer.writerow([name, team, role] + price_strs)
+                writer.writerow([name, team] + price_strs)
 
         print(f"Wrote {csv_path}")
 

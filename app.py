@@ -57,7 +57,7 @@ def _load_and_prepare(csv_path: str) -> pd.DataFrame | None:
     df = pd.read_csv(csv_path)
 
     # Identify ordinal price columns (everything after player, team, role)
-    price_cols = [c for c in df.columns if c not in ("player", "team", "role")]
+    price_cols = [c for c in df.columns if c not in ("player", "team")]
 
     # Build the output rows
     rows = []
@@ -70,7 +70,6 @@ def _load_and_prepare(csv_path: str) -> pd.DataFrame | None:
 
         out = {
             "Player": row["player"],
-            "Proj Role": row["role"],
             "Trend": trend,
             "Avg Price": avg_price,
         }
