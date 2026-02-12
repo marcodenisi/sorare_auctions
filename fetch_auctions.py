@@ -86,6 +86,7 @@ def fetch_auction_prices(slug: str) -> list[float]:
     """
     all_prices: list[float] = []
     to_cursor: str | None = None
+    prev_cursor: str | None = None
     first_request = True
 
     while True:
@@ -114,8 +115,7 @@ def fetch_auction_prices(slug: str) -> list[float]:
 
         # Surface non-complexity errors (e.g. "player not found")
         for err in body.get("errors", []):
-            print(f"\n  API error: {err.get('message', err)}")
-            print(f"  ", end="")
+            print(f"\n  API error: {err.get('message', err)}", end=" ")
 
         data = body.get("data") or {}
         tokens = data.get("tokens") or {}
@@ -144,6 +144,9 @@ def fetch_auction_prices(slug: str) -> list[float]:
         # Use the oldest date as the upper-bound for the next page
         if oldest_date is None:
             break
+        if oldest_date == prev_cursor:
+            break
+        prev_cursor = to_cursor
         to_cursor = oldest_date
 
     return all_prices
