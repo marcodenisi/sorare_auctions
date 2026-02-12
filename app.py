@@ -35,7 +35,7 @@ def _compute_trend(prices: list[float]) -> str:
     if len(valid) < 4:
         return "\u2014"  # em-dash
     overall_avg = sum(valid) / len(valid)
-    recent_avg = sum(valid[:3]) / 3
+    recent_avg = sum(valid[-3:]) / 3
     if overall_avg == 0:
         return "\u2192"
     ratio = (recent_avg - overall_avg) / overall_avg

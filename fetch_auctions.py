@@ -193,6 +193,7 @@ def main() -> None:
 
             print(f"Fetching {slug}...", end=" ", flush=True)
             prices = fetch_auction_prices(slug)
+            prices.reverse()  # oldest first: 1st = first auction chronologically
             print(f"{len(prices)} auctions found")
 
             rows.append((display_name(slug, team), team, role, prices))
