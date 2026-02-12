@@ -5,15 +5,15 @@ Queries the Sorare GraphQL API (unauthenticated) for each player's
 TokenAuction history on Limited cards, then writes one CSV per position
 group into the data/ directory.
 
-Note: Unauthenticated API access has a query-complexity budget of 500.
-Using the ``to`` date-windowing parameter pushes complexity above this
-limit, so pagination is only possible with an API key.  Without one the
-script fetches a single batch of up to BATCH_SIZE most-recent prices per
-player.
+Results are persisted in JSON files (data/history/*.json) so that
+repeated runs accumulate full history despite the API's per-request
+limit of ~20 results.
 """
 
 import csv
+import json
 import os
+import re
 import time
 
 import requests
@@ -55,14 +55,13 @@ POSITIONS = ["gk", "df", "mf", "fw"]
 # Helpers
 # ---------------------------------------------------------------------------
 
-def last_name_from_slug(slug: str) -> str:
-    """Extract capitalised last name from a slug like 'roman-celentano'."""
-    return slug.split("-")[-1].capitalize()
+def name_from_slug(slug: str) -> str:
+    """Derive a display name from a slug like 'roman-celentano' -> 'Roman Celentano'.
 
-
-def display_name(slug: str, team: str) -> str:
-    """Build the display name: 'Celentano (CIN)'."""
-    return f"{last_name_from_slug(slug)} ({team})"
+    Strips trailing date suffixes used for disambiguation (e.g. '-1998-09-01').
+    """
+    cleaned = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", slug)
+    return " ".join(part.capitalize() for part in cleaned.split("-"))
 
 
 def _has_complexity_error(body: dict) -> bool:
@@ -74,9 +73,23 @@ def _has_complexity_error(body: dict) -> bool:
     return False
 
 
-def fetch_auction_prices(slug: str) -> list[float]:
+def load_history(path: str) -> dict[str, float]:
+    """Load previously saved auction history {date: price} from JSON."""
+    if os.path.isfile(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_history(path: str, history: dict[str, float]) -> None:
+    """Save auction history {date: price} to JSON."""
+    with open(path, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def fetch_auction_prices(slug: str) -> list[tuple[str, float]]:
     """
-    Return a list of auction prices (USD dollars, float) for a player,
+    Return a list of (date, price_usd) tuples for a player's auctions,
     ordered most-recent-first.
 
     Uses date-windowing pagination:  fetch up to BATCH_SIZE results,
@@ -84,7 +97,7 @@ def fetch_auction_prices(slug: str) -> list[float]:
     the batch returns empty, fewer results than BATCH_SIZE, or the API
     rejects the query due to complexity limits (unauthenticated access).
     """
-    all_prices: list[float] = []
+    results: list[tuple[str, float]] = []
     to_cursor: str | None = None
     prev_cursor: str | None = None
     first_request = True
@@ -129,13 +142,14 @@ def fetch_auction_prices(slug: str) -> list[float]:
             deal = tp.get("deal")
             if deal and deal.get("id"):
                 usd_cents = tp["amounts"]["usdCents"]
-                all_prices.append(usd_cents / 100.0)
+                date = tp.get("date", "")
+                results.append((date, usd_cents / 100.0))
 
             # Track oldest date for pagination cursor
-            date = tp.get("date")
-            if date:
-                if oldest_date is None or date < oldest_date:
-                    oldest_date = date
+            d = tp.get("date")
+            if d:
+                if oldest_date is None or d < oldest_date:
+                    oldest_date = d
 
         # Stop if batch was smaller than requested (end of data)
         if len(token_prices) < BATCH_SIZE:
@@ -149,7 +163,7 @@ def fetch_auction_prices(slug: str) -> list[float]:
         prev_cursor = to_cursor
         to_cursor = oldest_date
 
-    return all_prices
+    return results
 
 
 def ordinal(n: int) -> str:
@@ -169,7 +183,8 @@ def main() -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     players_path = os.path.join(base_dir, "players.yaml")
     data_dir = os.path.join(base_dir, "data")
-    os.makedirs(data_dir, exist_ok=True)
+    history_dir = os.path.join(data_dir, "history")
+    os.makedirs(history_dir, exist_ok=True)
 
     with open(players_path, "r") as f:
         players_data = yaml.safe_load(f)
@@ -190,12 +205,29 @@ def main() -> None:
             if not (pos == POSITIONS[0] and i == 0):
                 time.sleep(SLEEP_SECONDS)
 
-            print(f"Fetching {slug}...", end=" ", flush=True)
-            prices = fetch_auction_prices(slug)
-            prices.reverse()  # oldest first: 1st = first auction chronologically
-            print(f"{len(prices)} auctions found")
+            # Load existing history for this player
+            history_path = os.path.join(history_dir, f"{slug}.json")
+            history = load_history(history_path)
 
-            rows.append((display_name(slug, team), team, prices))
+            print(f"Fetching {slug}...", end=" ", flush=True)
+            new_auctions = fetch_auction_prices(slug)
+
+            # Merge new auctions into history (date is the key)
+            new_count = 0
+            for date, price in new_auctions:
+                if date not in history:
+                    new_count += 1
+                history[date] = price
+
+            save_history(history_path, history)
+
+            # Sort by date ascending (oldest first) and extract prices
+            sorted_prices = [
+                price for _, price in sorted(history.items())
+            ]
+
+            print(f"{len(sorted_prices)} total auctions ({new_count} new)")
+            rows.append((name_from_slug(slug), team, sorted_prices))
 
         # Determine max number of price columns across all players in group
         max_prices = max((len(r[2]) for r in rows), default=0)

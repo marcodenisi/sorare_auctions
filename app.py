@@ -56,7 +56,7 @@ def _load_and_prepare(csv_path: str) -> pd.DataFrame | None:
 
     df = pd.read_csv(csv_path)
 
-    # Identify ordinal price columns (everything after player, team, role)
+    # Identify ordinal price columns (everything after player, team)
     price_cols = [c for c in df.columns if c not in ("player", "team")]
 
     # Build the output rows
@@ -70,6 +70,7 @@ def _load_and_prepare(csv_path: str) -> pd.DataFrame | None:
 
         out = {
             "Player": row["player"],
+            "Team": row["team"],
             "Trend": trend,
             "Avg Price": avg_price,
         }
@@ -104,4 +105,22 @@ for tab, (label, filename) in zip(tab_objects, TABS.items()):
         if df is None or df.empty:
             st.warning("No data. Run fetch_auctions.py first.")
         else:
-            st.dataframe(df, width="stretch", hide_index=True)
+            # Filters
+            col1, col2 = st.columns(2)
+            with col1:
+                teams = sorted(df["Team"].unique())
+                selected_teams = st.multiselect(
+                    "Team", teams, default=teams, key=f"{label}_team"
+                )
+            with col2:
+                player_search = st.text_input(
+                    "Player", placeholder="Search...", key=f"{label}_player"
+                )
+
+            filtered = df[df["Team"].isin(selected_teams)]
+            if player_search:
+                filtered = filtered[
+                    filtered["Player"].str.contains(player_search, case=False, na=False)
+                ]
+
+            st.dataframe(filtered, width="stretch", hide_index=True)
