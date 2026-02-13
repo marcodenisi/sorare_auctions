@@ -29,4 +29,4 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
-          git diff --cached --quiet || (git commit -m "chore: update auction data" && git push)
+          git diff --cached --quiet || (git commit -m "chore: update auction data" && git pull --rebase && git push)
