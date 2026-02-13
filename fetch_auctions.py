@@ -15,6 +15,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 
 import requests
 import yaml
@@ -247,6 +248,11 @@ def main() -> None:
                 writer.writerow([name, team] + price_strs)
 
         print(f"Wrote {csv_path}")
+
+    # Write last-updated timestamp
+    ts_path = os.path.join(data_dir, "last_updated.txt")
+    with open(ts_path, "w") as f:
+        f.write(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,11 @@ st.title("Sorare MLS Limited Auctions")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
+last_updated_path = os.path.join(DATA_DIR, "last_updated.txt")
+if os.path.isfile(last_updated_path):
+    with open(last_updated_path) as f:
+        st.caption(f"Last updated: {f.read().strip()}")
+
 TABS = {
     "Goalkeepers": "limited_gk.csv",
     "Defenders": "limited_df.csv",
