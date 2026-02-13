@@ -123,4 +123,20 @@ for tab, (label, filename) in zip(tab_objects, TABS.items()):
                     filtered["Player"].str.contains(player_search, case=False, na=False)
                 ]
 
-            st.dataframe(filtered, width="stretch", hide_index=True)
+            col_config = {
+                "Player": st.column_config.TextColumn(width=180),
+                "Team": st.column_config.TextColumn(width=60),
+                "Trend": st.column_config.TextColumn(width=60),
+                "Avg Price": st.column_config.TextColumn(width=90),
+            }
+            # Narrow price columns
+            for col in filtered.columns:
+                if col not in col_config:
+                    col_config[col] = st.column_config.TextColumn(width=80)
+
+            st.dataframe(
+                filtered,
+                width="stretch",
+                hide_index=True,
+                column_config=col_config,
+            )
