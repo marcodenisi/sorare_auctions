@@ -11,10 +11,10 @@ st.title("Sorare MLS Limited Auctions")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 TABS = {
-    "LimitedGK": "limited_gk.csv",
-    "LimitedDF": "limited_df.csv",
-    "LimitedMF": "limited_mf.csv",
-    "LimitedFW": "limited_fw.csv",
+    "Goalkeepers": "limited_gk.csv",
+    "Defenders": "limited_df.csv",
+    "Midfielders": "limited_mf.csv",
+    "Forwards": "limited_fw.csv",
 }
 
 
