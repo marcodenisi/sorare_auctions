@@ -1,14 +1,24 @@
-"""Streamlit dashboard for Sorare MLS Limited Auctions."""
+"""Streamlit dashboard for Sorare MLS Limited Auctions.
 
+Reads auction history from JSON files (data/history/*.json) and
+players.yaml to build position-grouped tables with multi-currency
+support.
+"""
+
+import json
 import os
+import re
 
 import pandas as pd
 import streamlit as st
+import yaml
 
 st.set_page_config(page_title="Sorare MLS Limited Auctions", layout="wide")
 st.title("Sorare MLS Limited Auctions")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+HISTORY_DIR = os.path.join(DATA_DIR, "history")
+PLAYERS_PATH = os.path.join(os.path.dirname(__file__), "players.yaml")
 
 last_updated_path = os.path.join(DATA_DIR, "last_updated.txt")
 if os.path.isfile(last_updated_path):
@@ -16,18 +26,39 @@ if os.path.isfile(last_updated_path):
         st.caption(f"Last updated: {f.read().strip()}")
 
 TABS = {
-    "Goalkeepers": "limited_gk.csv",
-    "Defenders": "limited_df.csv",
-    "Midfielders": "limited_mf.csv",
-    "Forwards": "limited_fw.csv",
+    "Goalkeepers": "gk",
+    "Defenders": "df",
+    "Midfielders": "mf",
+    "Forwards": "fw",
+}
+
+CURRENCIES = {
+    "USD": {"key": "usd", "symbol": "$", "decimals": 2},
+    "EUR": {"key": "eur", "symbol": "\u20ac", "decimals": 2},
+    "GBP": {"key": "gbp", "symbol": "\u00a3", "decimals": 2},
+    "ETH": {"key": "eth", "symbol": "\u039e", "decimals": 4},
 }
 
 
+# ---------------------------------------------------------------------------
+# Currency selector (at top, before tabs)
+# ---------------------------------------------------------------------------
+selected_currency = st.radio(
+    "Currency",
+    list(CURRENCIES.keys()),
+    horizontal=True,
+    index=0,
+)
+currency_cfg = CURRENCIES[selected_currency]
+
+
 def _format_price(value: float) -> str:
-    """Format a numeric price as $XXX.XX, or empty string if NaN."""
-    if pd.isna(value):
+    """Format a numeric price for the selected currency, or empty string if NaN/None."""
+    if value is None or pd.isna(value):
         return ""
-    return f"${value:,.2f}"
+    decimals = currency_cfg["decimals"]
+    symbol = currency_cfg["symbol"]
+    return f"{symbol}{value:,.{decimals}f}"
 
 
 def _compute_trend(prices: list[float]) -> str:
@@ -36,7 +67,7 @@ def _compute_trend(prices: list[float]) -> str:
     Returns:
         A trend string: up-arrow, down-arrow, right-arrow, or dash.
     """
-    valid = [p for p in prices if not pd.isna(p)]
+    valid = [p for p in prices if p is not None and not pd.isna(p)]
     if len(valid) < 4:
         return "\u2014"  # em-dash
     overall_avg = sum(valid) / len(valid)
@@ -51,44 +82,118 @@ def _compute_trend(prices: list[float]) -> str:
     return "\u2192"
 
 
-def _load_and_prepare(csv_path: str) -> pd.DataFrame | None:
-    """Load a CSV file and prepare the display DataFrame.
+def name_from_slug(slug: str) -> str:
+    """Derive a display name from a slug like 'roman-celentano' -> 'Roman Celentano'."""
+    cleaned = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", slug)
+    return " ".join(part.capitalize() for part in cleaned.split("-"))
 
-    Returns None if the file does not exist.
+
+def _ordinal(n: int) -> str:
+    """Return ordinal string for a 1-based index: 1 -> '1st', 2 -> '2nd', ..."""
+    if 11 <= (n % 100) <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _load_player_history(slug: str, currency_key: str) -> list[float | None]:
+    """Load a player's history JSON and extract prices for the given currency.
+
+    Returns prices sorted by date (ascending).  Old-format entries
+    (bare floats) are treated as USD.
     """
-    if not os.path.isfile(csv_path):
+    path = os.path.join(HISTORY_DIR, f"{slug}.json")
+    if not os.path.isfile(path):
+        return []
+
+    with open(path, "r") as f:
+        raw = json.load(f)
+
+    prices = []
+    for date in sorted(raw.keys()):
+        entry = raw[date]
+        if isinstance(entry, dict):
+            prices.append(entry.get(currency_key))
+        else:
+            # Legacy format: bare float = USD
+            if currency_key == "usd":
+                prices.append(float(entry))
+            else:
+                prices.append(None)
+    return prices
+
+
+def _load_and_prepare(position: str) -> pd.DataFrame | None:
+    """Load history JSONs for all players in a position and build the display DataFrame.
+
+    Returns None if players.yaml does not exist or the position has no players.
+    """
+    if not os.path.isfile(PLAYERS_PATH):
         return None
 
-    df = pd.read_csv(csv_path)
+    with open(PLAYERS_PATH, "r") as f:
+        players_data = yaml.safe_load(f)
 
-    # Identify ordinal price columns (everything after player, team)
-    price_cols = [c for c in df.columns if c not in ("player", "team")]
+    players = players_data.get(position, [])
+    if not players:
+        return None
 
-    # Build the output rows
+    currency_key = currency_cfg["key"]
+
     rows = []
-    for _, row in df.iterrows():
-        prices = [row[c] if c in row.index else float("nan") for c in price_cols]
-        valid_prices = [p for p in prices if not pd.isna(p)]
+    max_prices = 0
 
+    for p in players:
+        slug = p["slug"]
+        team = p["team"]
+        display_name = name_from_slug(slug)
+
+        prices = _load_player_history(slug, currency_key)
+        max_prices = max(max_prices, len(prices))
+
+        valid_prices = [v for v in prices if v is not None]
         avg_price = sum(valid_prices) / len(valid_prices) if valid_prices else 0.0
         trend = _compute_trend(prices)
 
+        rows.append({
+            "slug": slug,
+            "display_name": display_name,
+            "team": team,
+            "trend": trend,
+            "avg_price": avg_price,
+            "avg_price_raw": avg_price,
+            "prices": prices,
+        })
+
+    if not rows:
+        return None
+
+    # Build ordinal column names
+    price_cols = [_ordinal(n) for n in range(1, max_prices + 1)]
+
+    # Build output dicts
+    out_rows = []
+    for r in rows:
         out = {
-            "Player": row["player"],
-            "Team": row["team"],
-            "Trend": trend,
-            "Avg Price": avg_price,
+            "Player": r["display_name"],
+            "Team": r["team"],
+            "Trend": r["trend"],
+            "Avg Price": r["avg_price"],
         }
-        for col in price_cols:
-            val = row[col] if col in row.index else float("nan")
-            out[col] = val if not pd.isna(val) else None
+        for i, col in enumerate(price_cols):
+            if i < len(r["prices"]):
+                out[col] = r["prices"][i]
+            else:
+                out[col] = None
+        out["_avg_sort"] = r["avg_price_raw"]
+        out_rows.append(out)
 
-        rows.append(out)
-
-    result = pd.DataFrame(rows)
+    result = pd.DataFrame(out_rows)
 
     # Sort by average price descending
-    result = result.sort_values("Avg Price", ascending=False).reset_index(drop=True)
+    result = result.sort_values("_avg_sort", ascending=False).reset_index(drop=True)
+    result = result.drop(columns=["_avg_sort"])
 
     # Format prices for display
     result["Avg Price"] = result["Avg Price"].apply(_format_price)
@@ -103,10 +208,9 @@ def _load_and_prepare(csv_path: str) -> pd.DataFrame | None:
 
 tab_objects = st.tabs(list(TABS.keys()))
 
-for tab, (label, filename) in zip(tab_objects, TABS.items()):
+for tab, (label, position) in zip(tab_objects, TABS.items()):
     with tab:
-        csv_path = os.path.join(DATA_DIR, filename)
-        df = _load_and_prepare(csv_path)
+        df = _load_and_prepare(position)
         if df is None or df.empty:
             st.warning("No data. Run fetch_auctions.py first.")
         else:

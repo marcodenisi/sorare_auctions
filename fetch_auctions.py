@@ -11,8 +11,15 @@ API call, reducing total requests by ~3x.
 Results are persisted in JSON files (data/history/*.json) so that
 repeated runs accumulate full history despite the API's per-request
 limit of ~20 results.
+
+Multi-currency support: stores USD, EUR, GBP, and ETH prices in
+each history entry.  CSV files use USD for backward compatibility.
+
+Backfill mode (--backfill): paginates backward through each player's
+full auction history using date-windowing.
 """
 
+import argparse
 import csv
 import json
 import os
@@ -30,6 +37,9 @@ API_URL = "https://api.sorare.com/graphql"
 BATCH_SIZE = 20          # max results per player per API call
 PLAYERS_PER_BATCH = 3    # players per batched GraphQL request (conservative)
 SLEEP_SECONDS = 3        # stay within 20 calls/min unauthenticated limit
+BACKFILL_SLEEP_SECONDS = 5  # longer sleep in backfill mode
+
+WEI_PER_ETH = 10**18
 
 QUERY = """
 query GetLimitedAuctionHistory($playerSlug: String!, $first: Int, $to: ISO8601DateTime) {
@@ -42,6 +52,9 @@ query GetLimitedAuctionHistory($playerSlug: String!, $first: Int, $to: ISO8601Da
     ) {
       amounts {
         usdCents
+        eurCents
+        gbpCents
+        wei
       }
       date
       deal {
@@ -58,6 +71,9 @@ query GetLimitedAuctionHistory($playerSlug: String!, $first: Int, $to: ISO8601Da
 TOKEN_PRICES_FIELDS = """
       amounts {
         usdCents
+        eurCents
+        gbpCents
+        wei
       }
       date
       deal {
@@ -68,6 +84,40 @@ TOKEN_PRICES_FIELDS = """
 """
 
 POSITIONS = ["gk", "df", "mf", "fw"]
+
+# ---------------------------------------------------------------------------
+# Multi-currency price record helpers
+# ---------------------------------------------------------------------------
+
+def _make_price_record(amounts: dict) -> dict:
+    """Build a multi-currency price dict from an API 'amounts' object.
+
+    Returns: {"usd": float, "eur": float, "gbp": float, "eth": float}
+    """
+    usd_cents = amounts.get("usdCents")
+    eur_cents = amounts.get("eurCents")
+    gbp_cents = amounts.get("gbpCents")
+    wei = amounts.get("wei")
+
+    return {
+        "usd": usd_cents / 100.0 if usd_cents is not None else None,
+        "eur": eur_cents / 100.0 if eur_cents is not None else None,
+        "gbp": gbp_cents / 100.0 if gbp_cents is not None else None,
+        "eth": int(wei) / WEI_PER_ETH if wei is not None else None,
+    }
+
+
+def _migrate_old_entry(value) -> dict:
+    """Migrate a legacy history entry (bare float) to multi-currency format.
+
+    Old format: {date: 124.65}  (USD only)
+    New format: {date: {"usd": 124.65, "eur": null, "gbp": null, "eth": null}}
+    """
+    if isinstance(value, dict):
+        return value  # already new format
+    # Bare float/int -> treat as USD
+    return {"usd": float(value), "eur": None, "gbp": None, "eth": None}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -112,25 +162,26 @@ def build_batch_query(slugs: list[str]) -> str:
     return f"query {{\n  tokens {{\n{body}\n  }}\n}}"
 
 
-def _parse_token_prices(token_prices: list[dict]) -> list[tuple[str, float]]:
-    """Extract (date, price_usd) tuples from a tokenPrices response list.
+def _parse_token_prices(token_prices: list[dict]) -> list[tuple[str, dict]]:
+    """Extract (date, price_record) tuples from a tokenPrices response list.
 
     Only keeps TokenAuction deals (where deal.id is present).
+    Each price_record is {"usd": ..., "eur": ..., "gbp": ..., "eth": ...}.
     """
-    results: list[tuple[str, float]] = []
+    results: list[tuple[str, dict]] = []
     for tp in token_prices:
         deal = tp.get("deal")
         if deal and deal.get("id"):
-            usd_cents = tp["amounts"]["usdCents"]
+            price_record = _make_price_record(tp["amounts"])
             date = tp.get("date", "")
-            results.append((date, usd_cents / 100.0))
+            results.append((date, price_record))
     return results
 
 
-def fetch_batch_auction_prices(slugs: list[str]) -> dict[str, list[tuple[str, float]] | None]:
+def fetch_batch_auction_prices(slugs: list[str]) -> dict[str, list[tuple[str, dict]] | None]:
     """Fetch auction prices for multiple players in a single batched API call.
 
-    Returns a dict mapping slug -> list of (date, price_usd) tuples.
+    Returns a dict mapping slug -> list of (date, price_record) tuples.
     If the batch fails due to complexity, returns None for all slugs
     (signalling the caller should fall back to individual queries).
     """
@@ -156,7 +207,7 @@ def fetch_batch_auction_prices(slugs: list[str]) -> dict[str, list[tuple[str, fl
     data = body.get("data") or {}
     tokens = data.get("tokens") or {}
 
-    results: dict[str, list[tuple[str, float]]] = {}
+    results: dict[str, list[tuple[str, dict]]] = {}
     for i, slug in enumerate(slugs):
         alias = f"player{i}"
         token_prices = tokens.get(alias) or []
@@ -165,34 +216,45 @@ def fetch_batch_auction_prices(slugs: list[str]) -> dict[str, list[tuple[str, fl
     return results
 
 
-def load_history(path: str) -> dict[str, float]:
-    """Load previously saved auction history {date: price} from JSON."""
+def load_history(path: str) -> dict[str, dict]:
+    """Load previously saved auction history from JSON.
+
+    Handles backward compatibility: migrates old format {date: float}
+    to new format {date: {"usd": ..., "eur": ..., "gbp": ..., "eth": ...}}.
+    """
     if os.path.isfile(path):
         with open(path, "r") as f:
-            return json.load(f)
+            raw = json.load(f)
+        # Migrate each entry
+        return {date: _migrate_old_entry(val) for date, val in raw.items()}
     return {}
 
 
-def save_history(path: str, history: dict[str, float]) -> None:
-    """Save auction history {date: price} to JSON."""
+def save_history(path: str, history: dict[str, dict]) -> None:
+    """Save auction history to JSON."""
     with open(path, "w") as f:
         json.dump(history, f, indent=2)
 
 
-def fetch_auction_prices(slug: str) -> list[tuple[str, float]]:
+def fetch_auction_prices(slug: str, paginate: bool = False, sleep_seconds: int = SLEEP_SECONDS) -> list[tuple[str, dict]]:
     """
-    Return a list of (date, price_usd) tuples for a player's auctions,
+    Return a list of (date, price_record) tuples for a player's auctions,
     ordered most-recent-first.
 
-    Uses date-windowing pagination:  fetch up to BATCH_SIZE results,
+    If paginate=False (default), fetches only the first page (most recent
+    BATCH_SIZE results).  If paginate=True, uses date-windowing to fetch
+    all available history.
+
+    Uses date-windowing pagination: fetch up to BATCH_SIZE results,
     take the oldest date, use it as ``to`` for the next call.  Stop when
     the batch returns empty, fewer results than BATCH_SIZE, or the API
     rejects the query due to complexity limits (unauthenticated access).
     """
-    results: list[tuple[str, float]] = []
+    results: list[tuple[str, dict]] = []
     to_cursor: str | None = None
     prev_cursor: str | None = None
     first_request = True
+    page = 0
 
     while True:
         variables: dict = {"playerSlug": slug, "first": BATCH_SIZE}
@@ -202,7 +264,7 @@ def fetch_auction_prices(slug: str) -> list[tuple[str, float]]:
         # Rate-limit: sleep before every request except the very first
         # one for this player.
         if not first_request:
-            time.sleep(SLEEP_SECONDS)
+            time.sleep(sleep_seconds)
         first_request = False
 
         resp = requests.post(
@@ -233,9 +295,9 @@ def fetch_auction_prices(slug: str) -> list[tuple[str, float]]:
             # Only keep TokenAuction deals (deal.id is present)
             deal = tp.get("deal")
             if deal and deal.get("id"):
-                usd_cents = tp["amounts"]["usdCents"]
+                price_record = _make_price_record(tp["amounts"])
                 date = tp.get("date", "")
-                results.append((date, usd_cents / 100.0))
+                results.append((date, price_record))
 
             # Track oldest date for pagination cursor
             d = tp.get("date")
@@ -247,6 +309,10 @@ def fetch_auction_prices(slug: str) -> list[tuple[str, float]]:
         if len(token_prices) < BATCH_SIZE:
             break
 
+        # Only paginate if explicitly requested (backfill mode)
+        if not paginate:
+            break
+
         # Use the oldest date as the upper-bound for the next page
         if oldest_date is None:
             break
@@ -254,6 +320,7 @@ def fetch_auction_prices(slug: str) -> list[tuple[str, float]]:
             break
         prev_cursor = to_cursor
         to_cursor = oldest_date
+        page += 1
 
     return results
 
@@ -274,27 +341,179 @@ def ordinal(n: int) -> str:
 def _process_player_results(
     slug: str,
     team: str,
-    new_auctions: list[tuple[str, float]],
+    new_auctions: list[tuple[str, dict]],
     history_dir: str,
 ) -> tuple[str, str, list[float]]:
-    """Merge new auctions into history, save, and return a row tuple."""
+    """Merge new auctions into history, save, and return a row tuple.
+
+    Returns (display_name, team, [usd_prices_sorted_by_date]) for CSV output.
+    """
     history_path = os.path.join(history_dir, f"{slug}.json")
     history = load_history(history_path)
 
     new_count = 0
-    for date, price in new_auctions:
+    for date, price_record in new_auctions:
         if date not in history:
             new_count += 1
-        history[date] = price
+        history[date] = price_record
 
     save_history(history_path, history)
 
-    sorted_prices = [price for _, price in sorted(history.items())]
-    print(f"{len(sorted_prices)} total auctions ({new_count} new)")
-    return (name_from_slug(slug), team, sorted_prices)
+    # For CSV backward compatibility, extract USD prices sorted by date
+    sorted_usd_prices = []
+    for _, price_rec in sorted(history.items()):
+        usd = price_rec.get("usd")
+        if usd is not None:
+            sorted_usd_prices.append(usd)
+
+    print(f"{len(sorted_usd_prices)} total auctions ({new_count} new)")
+    return (name_from_slug(slug), team, sorted_usd_prices)
+
+
+def _backfill_player(
+    slug: str,
+    team: str,
+    initial_auctions: list[tuple[str, dict]],
+    history_dir: str,
+) -> tuple[str, str, list[float]]:
+    """Backfill a single player's full auction history.
+
+    After the initial fetch, paginates backward using the oldest date
+    from each batch as the 'to' parameter.
+
+    If the API returns a complexity error, waits 5 seconds and retries
+    the same page as an individual (non-batched) query.
+
+    Returns the same tuple format as _process_player_results.
+    """
+    history_path = os.path.join(history_dir, f"{slug}.json")
+    history = load_history(history_path)
+
+    new_count = 0
+    for date, price_record in initial_auctions:
+        if date not in history:
+            new_count += 1
+        history[date] = price_record
+
+    # If initial fetch already had fewer than BATCH_SIZE, no need to paginate
+    if len(initial_auctions) < BATCH_SIZE:
+        save_history(history_path, history)
+        sorted_usd_prices = [
+            rec.get("usd") for _, rec in sorted(history.items())
+            if rec.get("usd") is not None
+        ]
+        print(f"{len(sorted_usd_prices)} total auctions ({new_count} new, no further pages)")
+        return (name_from_slug(slug), team, sorted_usd_prices)
+
+    # Find the oldest date from the initial batch as starting cursor
+    oldest_date = None
+    for date, _ in initial_auctions:
+        if date and (oldest_date is None or date < oldest_date):
+            oldest_date = date
+
+    if oldest_date is None:
+        save_history(history_path, history)
+        sorted_usd_prices = [
+            rec.get("usd") for _, rec in sorted(history.items())
+            if rec.get("usd") is not None
+        ]
+        print(f"{len(sorted_usd_prices)} total auctions ({new_count} new)")
+        return (name_from_slug(slug), team, sorted_usd_prices)
+
+    # Paginate backward
+    to_cursor = oldest_date
+    prev_cursor = None
+    page = 2  # we already have page 1
+
+    while True:
+        time.sleep(BACKFILL_SLEEP_SECONDS)
+
+        variables: dict = {"playerSlug": slug, "first": BATCH_SIZE, "to": to_cursor}
+        resp = requests.post(
+            API_URL,
+            json={"query": QUERY, "variables": variables},
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+
+        if _has_complexity_error(body):
+            # Retry after waiting -- individual query with 'to' may also fail
+            print(f"\n    Complexity error on page {page}, waiting 5s and retrying...", end=" ", flush=True)
+            time.sleep(5)
+            resp = requests.post(
+                API_URL,
+                json={"query": QUERY, "variables": variables},
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+
+            if _has_complexity_error(body):
+                print(f"\n    Complexity error persists. Backfill requires an API key for deeper history.")
+                break
+
+        # Surface non-complexity errors
+        for err in body.get("errors", []):
+            print(f"\n    API error: {err.get('message', err)}", end=" ")
+
+        data = body.get("data") or {}
+        tokens = data.get("tokens") or {}
+        token_prices = tokens.get("tokenPrices") or []
+        if not token_prices:
+            break
+
+        page_new = 0
+        page_oldest = None
+        for tp in token_prices:
+            deal = tp.get("deal")
+            if deal and deal.get("id"):
+                price_record = _make_price_record(tp["amounts"])
+                date = tp.get("date", "")
+                is_new = date not in history
+                if is_new:
+                    page_new += 1
+                    new_count += 1
+                history[date] = price_record
+
+            d = tp.get("date")
+            if d:
+                if page_oldest is None or d < page_oldest:
+                    page_oldest = d
+
+        print(f"  Backfilling {slug}... page {page} ({page_new} more auctions)", flush=True)
+
+        if len(token_prices) < BATCH_SIZE:
+            break
+
+        if page_oldest is None:
+            break
+        if page_oldest == prev_cursor:
+            break
+        prev_cursor = to_cursor
+        to_cursor = page_oldest
+        page += 1
+
+    save_history(history_path, history)
+    sorted_usd_prices = [
+        rec.get("usd") for _, rec in sorted(history.items())
+        if rec.get("usd") is not None
+    ]
+    print(f"  {slug}: {len(sorted_usd_prices)} total auctions after backfill")
+    return (name_from_slug(slug), team, sorted_usd_prices)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Fetch Sorare auction prices")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Paginate backward through full auction history for each player",
+    )
+    args = parser.parse_args()
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
     players_path = os.path.join(base_dir, "players.yaml")
     data_dir = os.path.join(base_dir, "data")
@@ -313,7 +532,7 @@ def main() -> None:
         if not players:
             continue
 
-        # Collect rows: each row is (display_name, team, [prices])
+        # Collect rows: each row is (display_name, team, [usd_prices])
         rows: list[tuple[str, str, list[float]]] = []
 
         # Process players in batches of PLAYERS_PER_BATCH
@@ -342,9 +561,13 @@ def main() -> None:
                     team = p["team"]
                     time.sleep(SLEEP_SECONDS)
                     print(f"  [fallback] Fetching {slug}...", end=" ", flush=True)
-                    new_auctions = fetch_auction_prices(slug)
+                    new_auctions = fetch_auction_prices(slug, paginate=args.backfill,
+                                                        sleep_seconds=BACKFILL_SLEEP_SECONDS if args.backfill else SLEEP_SECONDS)
                     api_calls += 1
-                    rows.append(_process_player_results(slug, team, new_auctions, history_dir))
+                    if args.backfill:
+                        rows.append(_backfill_player(slug, team, new_auctions, history_dir))
+                    else:
+                        rows.append(_process_player_results(slug, team, new_auctions, history_dir))
             else:
                 # Process batched results
                 for p in batch:
@@ -352,7 +575,10 @@ def main() -> None:
                     team = p["team"]
                     print(f"  {slug}...", end=" ", flush=True)
                     new_auctions = batch_results[slug]
-                    rows.append(_process_player_results(slug, team, new_auctions, history_dir))
+                    if args.backfill:
+                        rows.append(_backfill_player(slug, team, new_auctions, history_dir))
+                    else:
+                        rows.append(_process_player_results(slug, team, new_auctions, history_dir))
 
         # Determine max number of price columns across all players in group
         max_prices = max((len(r[2]) for r in rows), default=0)
