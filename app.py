@@ -310,21 +310,28 @@ for tab, (label, position) in zip(tab_objects, TABS.items()):
             "5th Last": st.column_config.TextColumn(width=80),
         }
 
-        st.dataframe(
+        player_names = filtered["Player"].tolist()
+        event = st.dataframe(
             filtered,
             width="stretch",
             hide_index=True,
             column_config=col_config,
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"{label}_table",
         )
 
-        # Player detail section: stats + chart
-        player_names = filtered["Player"].tolist()
-        if player_names:
+        if event.selection.rows:
+            selected_idx = event.selection.rows[0]
+            selected_player = player_names[selected_idx] if selected_idx < len(player_names) else None
+        else:
             selected_player = st.selectbox(
                 "Player details",
                 player_names,
                 key=f"{label}_detail",
-            )
+            ) if player_names else None
+
+        if selected_player:
             detail = player_details.get(selected_player)
             if detail and detail["valid_prices"]:
                 vp = detail["valid_prices"]
