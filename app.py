@@ -7,7 +7,6 @@ support.
 
 import json
 import os
-import re
 import statistics
 from datetime import datetime, timezone
 
@@ -15,6 +14,8 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 import yaml
+
+from utils import name_from_slug
 
 st.set_page_config(page_title="Sorare MLS Limited Auctions", layout="wide")
 st.title("Sorare MLS Limited Auctions")
@@ -85,19 +86,28 @@ def _compute_trend(prices: list[float]) -> str:
     return "\u2192"
 
 
-def name_from_slug(slug: str) -> str:
-    """Derive a display name from a slug like 'roman-celentano' -> 'Roman Celentano'."""
-    cleaned = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", slug)
-    return " ".join(part.capitalize() for part in cleaned.split("-"))
 
 
-def _ordinal(n: int) -> str:
-    """Return ordinal string for a 1-based index: 1 -> '1st', 2 -> '2nd', ..."""
-    if 11 <= (n % 100) <= 13:
-        suffix = "th"
-    else:
-        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-    return f"{n}{suffix}"
+def _compute_value(prices: list[float]) -> str:
+    """Compute value indicator comparing recent prices to historical average.
+
+    Returns "BUY" if recent prices are >1 std dev below average,
+    "watch" if >0.5 std dev below, or empty string otherwise.
+    """
+    valid = [p for p in prices if p is not None and not pd.isna(p)]
+    if len(valid) < 4:
+        return ""
+    avg = sum(valid) / len(valid)
+    stdev = statistics.stdev(valid)
+    if stdev == 0:
+        return ""
+    recent_avg = sum(valid[-3:]) / 3
+    score = (avg - recent_avg) / stdev
+    if score > 1.0:
+        return "BUY"
+    if score > 0.5:
+        return "watch"
+    return ""
 
 
 def _relative_time(iso_date: str) -> str:
@@ -176,6 +186,7 @@ def _load_and_prepare(position: str) -> tuple[pd.DataFrame, dict] | None:
         valid_prices = [v for v in prices if v is not None]
         avg_price = sum(valid_prices) / len(valid_prices) if valid_prices else 0.0
         trend = _compute_trend(prices)
+        value = _compute_value(prices)
         last_auction = _relative_time(dates[-1]) if dates else "—"
 
         rows.append({
@@ -183,6 +194,7 @@ def _load_and_prepare(position: str) -> tuple[pd.DataFrame, dict] | None:
             "display_name": display_name,
             "team": team,
             "trend": trend,
+            "value": value,
             "avg_price": avg_price,
             "avg_price_raw": avg_price,
             "prices": prices,
@@ -207,6 +219,7 @@ def _load_and_prepare(position: str) -> tuple[pd.DataFrame, dict] | None:
             "Player": r["display_name"],
             "Team": r["team"],
             "Trend": r["trend"],
+            "Value": r["value"],
             "Last Auction": r["last_auction"],
             "Avg Price": r["avg_price"],
             "Price History": sparkline,
@@ -284,6 +297,7 @@ for tab, (label, position) in zip(tab_objects, TABS.items()):
             "Player": st.column_config.TextColumn(width=180),
             "Team": st.column_config.TextColumn(width=60),
             "Trend": st.column_config.TextColumn(width=60),
+            "Value": st.column_config.TextColumn(width=60),
             "Last Auction": st.column_config.TextColumn(width=100),
             "Avg Price": st.column_config.TextColumn(width=90),
             "Price History": st.column_config.LineChartColumn(
@@ -349,3 +363,86 @@ for tab, (label, position) in zip(tab_objects, TABS.items()):
                             .interactive()
                         )
                         st.altair_chart(chart, use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# Compare (persistent section below tabs)
+# ---------------------------------------------------------------------------
+st.divider()
+with st.expander("Compare Players Across Positions", expanded=False):
+    if not os.path.isfile(PLAYERS_PATH):
+        st.warning("No data. Run fetch_auctions.py first.")
+    else:
+        with open(PLAYERS_PATH, "r") as f:
+            all_players_data = yaml.safe_load(f)
+
+        # Build flat list of all players across positions
+        all_players = []
+        for pos in TABS.values():
+            for p in all_players_data.get(pos, []):
+                display = name_from_slug(p["slug"])
+                all_players.append({"slug": p["slug"], "team": p["team"], "name": display})
+
+        player_options = [f"{p['name']} ({p['team']})" for p in all_players]
+
+        selected = st.multiselect(
+            "Select players to compare (2-4)",
+            player_options,
+            max_selections=4,
+            key="compare_players",
+        )
+
+        if len(selected) >= 2:
+            currency_key = currency_cfg["key"]
+            chart_rows = []
+            stats_rows = []
+
+            for label_str in selected:
+                idx = player_options.index(label_str)
+                p = all_players[idx]
+                dates, prices = _load_player_history(p["slug"], currency_key)
+                valid = [v for v in prices if v is not None]
+
+                for d, price in zip(dates, prices):
+                    if price is not None:
+                        chart_rows.append({"Date": d, "Price": price, "Player": p["name"]})
+
+                if valid:
+                    stats_rows.append({
+                        "Player": p["name"],
+                        "Team": p["team"],
+                        "Avg": _format_price(sum(valid) / len(valid)),
+                        "Min": _format_price(min(valid)),
+                        "Max": _format_price(max(valid)),
+                        "Median": _format_price(statistics.median(valid)),
+                        "Std Dev": _format_price(statistics.stdev(valid)) if len(valid) >= 2 else "—",
+                        "Auctions": len(valid),
+                    })
+
+            if chart_rows:
+                chart_df = pd.DataFrame(chart_rows)
+                chart_df["Date"] = pd.to_datetime(chart_df["Date"])
+                chart = (
+                    alt.Chart(chart_df)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("Date:T", title="Date"),
+                        y=alt.Y("Price:Q", title=f"Price ({selected_currency})", scale=alt.Scale(zero=False)),
+                        color=alt.Color("Player:N"),
+                        tooltip=[
+                            alt.Tooltip("Player:N"),
+                            alt.Tooltip("Date:T", format="%b %d, %H:%M"),
+                            alt.Tooltip("Price:Q", format=",.2f", title=f"Price ({selected_currency})"),
+                        ],
+                    )
+                    .interactive()
+                )
+                st.altair_chart(chart, use_container_width=True)
+
+            if stats_rows:
+                st.dataframe(
+                    pd.DataFrame(stats_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+        elif len(selected) == 1:
+            st.info("Select at least 2 players to compare.")

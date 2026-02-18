@@ -20,15 +20,15 @@ full auction history using date-windowing.
 """
 
 import argparse
-import csv
 import json
 import os
-import re
 import time
 from datetime import datetime, timezone
 
 import requests
 import yaml
+
+from utils import name_from_slug
 
 # ---------------------------------------------------------------------------
 # Config
@@ -122,15 +122,6 @@ def _migrate_old_entry(value) -> dict:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def name_from_slug(slug: str) -> str:
-    """Derive a display name from a slug like 'roman-celentano' -> 'Roman Celentano'.
-
-    Strips trailing date suffixes used for disambiguation (e.g. '-1998-09-01').
-    """
-    cleaned = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", slug)
-    return " ".join(part.capitalize() for part in cleaned.split("-"))
-
 
 def _has_complexity_error(body: dict) -> bool:
     """Return True if the API response contains a query-complexity error."""
@@ -332,29 +323,16 @@ def fetch_auction_prices(slug: str, paginate: bool = False, sleep_seconds: int =
     return results
 
 
-def ordinal(n: int) -> str:
-    """Return ordinal string for a 1-based index: 1 -> '1st', 2 -> '2nd', ..."""
-    if 11 <= (n % 100) <= 13:
-        suffix = "th"
-    else:
-        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-    return f"{n}{suffix}"
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def _process_player_results(
     slug: str,
-    team: str,
     new_auctions: list[tuple[str, dict]],
     history_dir: str,
-) -> tuple[str, str, list[float]]:
-    """Merge new auctions into history, save, and return a row tuple.
-
-    Returns (display_name, team, [usd_prices_sorted_by_date]) for CSV output.
-    """
+) -> None:
+    """Merge new auctions into history and save."""
     history_path = os.path.join(history_dir, f"{slug}.json")
     history = load_history(history_path)
 
@@ -365,26 +343,16 @@ def _process_player_results(
         history[date] = price_record
 
     save_history(history_path, history)
-
-    # For CSV backward compatibility, extract USD prices sorted by date
-    sorted_usd_prices = []
-    for _, price_rec in sorted(history.items()):
-        usd = price_rec.get("usd")
-        if usd is not None:
-            sorted_usd_prices.append(usd)
-
-    print(f"{len(sorted_usd_prices)} total auctions ({new_count} new)")
-    return (name_from_slug(slug), team, sorted_usd_prices)
+    print(f"{len(history)} total auctions ({new_count} new)")
 
 
 def _backfill_player(
     slug: str,
-    team: str,
     initial_auctions: list[tuple[str, dict]],
     raw_count: int,
     initial_oldest_date: str | None,
     history_dir: str,
-) -> tuple[str, str, list[float]]:
+) -> None:
     """Backfill a single player's full auction history.
 
     After the initial fetch, paginates backward using the oldest date
@@ -396,8 +364,6 @@ def _backfill_player(
 
     If the API returns a complexity error, waits 5 seconds and retries
     the same page as an individual (non-batched) query.
-
-    Returns the same tuple format as _process_player_results.
     """
     history_path = os.path.join(history_dir, f"{slug}.json")
     history = load_history(history_path)
@@ -411,23 +377,15 @@ def _backfill_player(
     # If the raw API response had fewer than BATCH_SIZE, no more pages
     if raw_count < BATCH_SIZE:
         save_history(history_path, history)
-        sorted_usd_prices = [
-            rec.get("usd") for _, rec in sorted(history.items())
-            if rec.get("usd") is not None
-        ]
-        print(f"{len(sorted_usd_prices)} total auctions ({new_count} new, no further pages)")
-        return (name_from_slug(slug), team, sorted_usd_prices)
+        print(f"{len(history)} total auctions ({new_count} new, no further pages)")
+        return
 
     oldest_date = initial_oldest_date
 
     if oldest_date is None:
         save_history(history_path, history)
-        sorted_usd_prices = [
-            rec.get("usd") for _, rec in sorted(history.items())
-            if rec.get("usd") is not None
-        ]
-        print(f"{len(sorted_usd_prices)} total auctions ({new_count} new)")
-        return (name_from_slug(slug), team, sorted_usd_prices)
+        print(f"{len(history)} total auctions ({new_count} new)")
+        return
 
     # Paginate backward
     to_cursor = oldest_date
@@ -506,12 +464,7 @@ def _backfill_player(
         page += 1
 
     save_history(history_path, history)
-    sorted_usd_prices = [
-        rec.get("usd") for _, rec in sorted(history.items())
-        if rec.get("usd") is not None
-    ]
-    print(f"  {slug}: {len(sorted_usd_prices)} total auctions after backfill")
-    return (name_from_slug(slug), team, sorted_usd_prices)
+    print(f"  {slug}: {len(history)} total auctions after backfill")
 
 
 def main() -> None:
@@ -541,9 +494,6 @@ def main() -> None:
         if not players:
             continue
 
-        # Collect rows: each row is (display_name, team, [usd_prices])
-        rows: list[tuple[str, str, list[float]]] = []
-
         # Process players in batches of PLAYERS_PER_BATCH
         for batch_start in range(0, len(players), PLAYERS_PER_BATCH):
             batch = players[batch_start:batch_start + PLAYERS_PER_BATCH]
@@ -568,43 +518,22 @@ def main() -> None:
                 # fetch_auction_prices handles its own pagination when paginate=True
                 for p in batch:
                     slug = p["slug"]
-                    team = p["team"]
                     time.sleep(SLEEP_SECONDS)
                     print(f"  [fallback] Fetching {slug}...", end=" ", flush=True)
                     new_auctions = fetch_auction_prices(slug, paginate=args.backfill,
                                                         sleep_seconds=BACKFILL_SLEEP_SECONDS if args.backfill else SLEEP_SECONDS)
                     api_calls += 1
-                    rows.append(_process_player_results(slug, team, new_auctions, history_dir))
+                    _process_player_results(slug, new_auctions, history_dir)
             else:
                 # Process batched results
                 for p in batch:
                     slug = p["slug"]
-                    team = p["team"]
                     print(f"  {slug}...", end=" ", flush=True)
                     auctions, raw_count, oldest_date = batch_results[slug]
                     if args.backfill:
-                        rows.append(_backfill_player(slug, team, auctions, raw_count, oldest_date, history_dir))
+                        _backfill_player(slug, auctions, raw_count, oldest_date, history_dir)
                     else:
-                        rows.append(_process_player_results(slug, team, auctions, history_dir))
-
-        # Determine max number of price columns across all players in group
-        max_prices = max((len(r[2]) for r in rows), default=0)
-
-        # Build header
-        header = ["player", "team"]
-        header += [ordinal(n) for n in range(1, max_prices + 1)]
-
-        csv_path = os.path.join(data_dir, f"limited_{pos}.csv")
-        with open(csv_path, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(header)
-            for name, team, prices in rows:
-                price_strs = [f"{p:.2f}" for p in prices]
-                # Pad with empty strings if this player has fewer prices
-                price_strs += [""] * (max_prices - len(price_strs))
-                writer.writerow([name, team] + price_strs)
-
-        print(f"Wrote {csv_path}")
+                        _process_player_results(slug, new_auctions=auctions, history_dir=history_dir)
 
     elapsed = time.time() - start_time
     print(f"\nDone in {elapsed:.1f}s with {api_calls} API calls")
