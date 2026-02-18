@@ -8,7 +8,10 @@ support.
 import json
 import os
 import re
+import statistics
+from datetime import datetime, timezone
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 import yaml
@@ -97,22 +100,40 @@ def _ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 
-def _load_player_history(slug: str, currency_key: str) -> list[float | None]:
-    """Load a player's history JSON and extract prices for the given currency.
+def _relative_time(iso_date: str) -> str:
+    """Return a human-readable relative time string like '2h ago' or '3d ago'."""
+    dt = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
+    delta = datetime.now(timezone.utc) - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
 
-    Returns prices sorted by date (ascending).  Old-format entries
+
+def _load_player_history(
+    slug: str, currency_key: str
+) -> tuple[list[str], list[float | None]]:
+    """Load a player's history JSON and extract dates and prices.
+
+    Returns (dates, prices) sorted by date ascending.  Old-format entries
     (bare floats) are treated as USD.
     """
     path = os.path.join(HISTORY_DIR, f"{slug}.json")
     if not os.path.isfile(path):
-        return []
+        return [], []
 
     with open(path, "r") as f:
         raw = json.load(f)
 
+    dates = []
     prices = []
     for date in sorted(raw.keys()):
         entry = raw[date]
+        dates.append(date)
         if isinstance(entry, dict):
             prices.append(entry.get(currency_key))
         else:
@@ -121,13 +142,13 @@ def _load_player_history(slug: str, currency_key: str) -> list[float | None]:
                 prices.append(float(entry))
             else:
                 prices.append(None)
-    return prices
+    return dates, prices
 
 
-def _load_and_prepare(position: str) -> pd.DataFrame | None:
+def _load_and_prepare(position: str) -> tuple[pd.DataFrame, dict] | None:
     """Load history JSONs for all players in a position and build the display DataFrame.
 
-    Returns None if players.yaml does not exist or the position has no players.
+    Returns (DataFrame, player_details) or None if no data available.
     """
     if not os.path.isfile(PLAYERS_PATH):
         return None
@@ -149,12 +170,13 @@ def _load_and_prepare(position: str) -> pd.DataFrame | None:
         team = p["team"]
         display_name = name_from_slug(slug)
 
-        prices = _load_player_history(slug, currency_key)
+        dates, prices = _load_player_history(slug, currency_key)
         max_prices = max(max_prices, len(prices))
 
         valid_prices = [v for v in prices if v is not None]
         avg_price = sum(valid_prices) / len(valid_prices) if valid_prices else 0.0
         trend = _compute_trend(prices)
+        last_auction = _relative_time(dates[-1]) if dates else "—"
 
         rows.append({
             "slug": slug,
@@ -164,30 +186,41 @@ def _load_and_prepare(position: str) -> pd.DataFrame | None:
             "avg_price": avg_price,
             "avg_price_raw": avg_price,
             "prices": prices,
+            "dates": dates,
+            "last_auction": last_auction,
         })
 
     if not rows:
         return None
 
-    # Build ordinal column names
-    price_cols = [_ordinal(n) for n in range(1, max_prices + 1)]
-
-    # Build output dicts
+    # Build output dicts and per-player detail data
     out_rows = []
+    player_details = {}  # display_name -> {dates, prices, valid_prices}
     for r in rows:
+        valid = [v for v in r["prices"] if v is not None]
+        # Sparkline: all valid prices (ascending order, oldest to newest)
+        sparkline = valid if valid else []
+        # Last 5 auction prices (most recent first)
+        last_5 = list(reversed(valid[-5:])) if valid else []
+
         out = {
             "Player": r["display_name"],
             "Team": r["team"],
             "Trend": r["trend"],
+            "Last Auction": r["last_auction"],
             "Avg Price": r["avg_price"],
+            "Price History": sparkline,
         }
-        for i, col in enumerate(price_cols):
-            if i < len(r["prices"]):
-                out[col] = r["prices"][i]
-            else:
-                out[col] = None
+        recent_labels = ["Latest", "2nd Last", "3rd Last", "4th Last", "5th Last"]
+        for i, col in enumerate(recent_labels):
+            out[col] = last_5[i] if i < len(last_5) else None
         out["_avg_sort"] = r["avg_price_raw"]
         out_rows.append(out)
+        player_details[r["display_name"]] = {
+            "dates": r["dates"],
+            "prices": r["prices"],
+            "valid_prices": valid,
+        }
 
     result = pd.DataFrame(out_rows)
 
@@ -197,55 +230,122 @@ def _load_and_prepare(position: str) -> pd.DataFrame | None:
 
     # Format prices for display
     result["Avg Price"] = result["Avg Price"].apply(_format_price)
-    for col in price_cols:
+    for col in ["Latest", "2nd Last", "3rd Last", "4th Last", "5th Last"]:
         if col in result.columns:
             result[col] = result[col].apply(
                 lambda v: _format_price(v) if v is not None else ""
             )
 
-    return result
+    return result, player_details
 
 
 tab_objects = st.tabs(list(TABS.keys()))
 
 for tab, (label, position) in zip(tab_objects, TABS.items()):
     with tab:
-        df = _load_and_prepare(position)
-        if df is None or df.empty:
+        loaded = _load_and_prepare(position)
+        if loaded is None:
             st.warning("No data. Run fetch_auctions.py first.")
-        else:
-            # Filters
-            col1, col2 = st.columns(2)
-            with col1:
-                teams = sorted(df["Team"].unique())
-                selected_teams = st.multiselect(
-                    "Team", teams, default=teams, key=f"{label}_team"
-                )
-            with col2:
-                player_search = st.text_input(
-                    "Player", placeholder="Search...", key=f"{label}_player"
-                )
+            continue
+        df, player_details = loaded
+        if df.empty:
+            st.warning("No data. Run fetch_auctions.py first.")
+            continue
 
-            filtered = df[df["Team"].isin(selected_teams)]
-            if player_search:
-                filtered = filtered[
-                    filtered["Player"].str.contains(player_search, case=False, na=False)
-                ]
-
-            col_config = {
-                "Player": st.column_config.TextColumn(width=180),
-                "Team": st.column_config.TextColumn(width=60),
-                "Trend": st.column_config.TextColumn(width=60),
-                "Avg Price": st.column_config.TextColumn(width=90),
-            }
-            # Narrow price columns
-            for col in filtered.columns:
-                if col not in col_config:
-                    col_config[col] = st.column_config.TextColumn(width=80)
-
-            st.dataframe(
-                filtered,
-                width="stretch",
-                hide_index=True,
-                column_config=col_config,
+        # Filters
+        col1, col2 = st.columns(2)
+        with col1:
+            teams = sorted(df["Team"].unique())
+            selected_teams = st.multiselect(
+                "Team", teams, default=teams, key=f"{label}_team"
             )
+        with col2:
+            player_search = st.text_input(
+                "Player", placeholder="Search...", key=f"{label}_player"
+            )
+
+        filtered = df[df["Team"].isin(selected_teams)]
+        if player_search:
+            filtered = filtered[
+                filtered["Player"].str.contains(player_search, case=False, na=False)
+            ]
+
+        # CSV export
+        csv_data = filtered.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download CSV",
+            csv_data,
+            file_name=f"sorare_{position}_{selected_currency.lower()}.csv",
+            mime="text/csv",
+            key=f"{label}_csv",
+        )
+
+        col_config = {
+            "Player": st.column_config.TextColumn(width=180),
+            "Team": st.column_config.TextColumn(width=60),
+            "Trend": st.column_config.TextColumn(width=60),
+            "Last Auction": st.column_config.TextColumn(width=100),
+            "Avg Price": st.column_config.TextColumn(width=90),
+            "Price History": st.column_config.LineChartColumn(
+                "Price History", width=150,
+            ),
+            "Latest": st.column_config.TextColumn(width=80),
+            "2nd Last": st.column_config.TextColumn(width=80),
+            "3rd Last": st.column_config.TextColumn(width=80),
+            "4th Last": st.column_config.TextColumn(width=80),
+            "5th Last": st.column_config.TextColumn(width=80),
+        }
+
+        st.dataframe(
+            filtered,
+            width="stretch",
+            hide_index=True,
+            column_config=col_config,
+        )
+
+        # Player detail section: stats + chart
+        player_names = filtered["Player"].tolist()
+        if player_names:
+            selected_player = st.selectbox(
+                "Player details",
+                player_names,
+                key=f"{label}_detail",
+            )
+            detail = player_details.get(selected_player)
+            if detail and detail["valid_prices"]:
+                vp = detail["valid_prices"]
+                with st.expander(f"{selected_player} — Stats & Price Chart", expanded=True):
+                    # Stats
+                    cols = st.columns(5)
+                    cols[0].metric("Auctions", len(vp))
+                    cols[1].metric("Min", _format_price(min(vp)))
+                    cols[2].metric("Max", _format_price(max(vp)))
+                    cols[3].metric("Median", _format_price(statistics.median(vp)))
+                    if len(vp) >= 2:
+                        cols[4].metric("Std Dev", _format_price(statistics.stdev(vp)))
+                    else:
+                        cols[4].metric("Std Dev", "—")
+
+                    # Price chart
+                    chart_data = [
+                        {"Date": d, "Price": p}
+                        for d, p in zip(detail["dates"], detail["prices"])
+                        if p is not None
+                    ]
+                    if chart_data:
+                        chart_df = pd.DataFrame(chart_data)
+                        chart_df["Date"] = pd.to_datetime(chart_df["Date"])
+                        chart = (
+                            alt.Chart(chart_df)
+                            .mark_line(point=True)
+                            .encode(
+                                x=alt.X("Date:T", title="Date"),
+                                y=alt.Y("Price:Q", title=f"Price ({selected_currency})", scale=alt.Scale(zero=False)),
+                                tooltip=[
+                                    alt.Tooltip("Date:T", format="%b %d, %H:%M"),
+                                    alt.Tooltip("Price:Q", format=",.2f", title=f"Price ({selected_currency})"),
+                                ],
+                            )
+                            .interactive()
+                        )
+                        st.altair_chart(chart, use_container_width=True)
