@@ -162,26 +162,33 @@ def build_batch_query(slugs: list[str]) -> str:
     return f"query {{\n  tokens {{\n{body}\n  }}\n}}"
 
 
-def _parse_token_prices(token_prices: list[dict]) -> list[tuple[str, dict]]:
+def _parse_token_prices(token_prices: list[dict]) -> tuple[list[tuple[str, dict]], int, str | None]:
     """Extract (date, price_record) tuples from a tokenPrices response list.
 
     Only keeps TokenAuction deals (where deal.id is present).
     Each price_record is {"usd": ..., "eur": ..., "gbp": ..., "eth": ...}.
+
+    Returns (auctions, raw_count, oldest_date) where raw_count is the total
+    number of entries before filtering (needed for pagination decisions).
     """
     results: list[tuple[str, dict]] = []
+    oldest_date: str | None = None
     for tp in token_prices:
         deal = tp.get("deal")
         if deal and deal.get("id"):
             price_record = _make_price_record(tp["amounts"])
             date = tp.get("date", "")
             results.append((date, price_record))
-    return results
+        d = tp.get("date")
+        if d and (oldest_date is None or d < oldest_date):
+            oldest_date = d
+    return results, len(token_prices), oldest_date
 
 
-def fetch_batch_auction_prices(slugs: list[str]) -> dict[str, list[tuple[str, dict]] | None]:
+def fetch_batch_auction_prices(slugs: list[str]) -> dict[str, tuple[list[tuple[str, dict]], int, str | None] | None]:
     """Fetch auction prices for multiple players in a single batched API call.
 
-    Returns a dict mapping slug -> list of (date, price_record) tuples.
+    Returns a dict mapping slug -> (auctions, raw_count, oldest_date) or None.
     If the batch fails due to complexity, returns None for all slugs
     (signalling the caller should fall back to individual queries).
     """
@@ -207,7 +214,7 @@ def fetch_batch_auction_prices(slugs: list[str]) -> dict[str, list[tuple[str, di
     data = body.get("data") or {}
     tokens = data.get("tokens") or {}
 
-    results: dict[str, list[tuple[str, dict]]] = {}
+    results = {}
     for i, slug in enumerate(slugs):
         alias = f"player{i}"
         token_prices = tokens.get(alias) or []
@@ -374,12 +381,18 @@ def _backfill_player(
     slug: str,
     team: str,
     initial_auctions: list[tuple[str, dict]],
+    raw_count: int,
+    initial_oldest_date: str | None,
     history_dir: str,
 ) -> tuple[str, str, list[float]]:
     """Backfill a single player's full auction history.
 
     After the initial fetch, paginates backward using the oldest date
     from each batch as the 'to' parameter.
+
+    raw_count is the total API results before auction filtering (used to
+    decide if there are more pages — the API returns up to BATCH_SIZE
+    results including non-auction deals).
 
     If the API returns a complexity error, waits 5 seconds and retries
     the same page as an individual (non-batched) query.
@@ -395,8 +408,8 @@ def _backfill_player(
             new_count += 1
         history[date] = price_record
 
-    # If initial fetch already had fewer than BATCH_SIZE, no need to paginate
-    if len(initial_auctions) < BATCH_SIZE:
+    # If the raw API response had fewer than BATCH_SIZE, no more pages
+    if raw_count < BATCH_SIZE:
         save_history(history_path, history)
         sorted_usd_prices = [
             rec.get("usd") for _, rec in sorted(history.items())
@@ -405,11 +418,7 @@ def _backfill_player(
         print(f"{len(sorted_usd_prices)} total auctions ({new_count} new, no further pages)")
         return (name_from_slug(slug), team, sorted_usd_prices)
 
-    # Find the oldest date from the initial batch as starting cursor
-    oldest_date = None
-    for date, _ in initial_auctions:
-        if date and (oldest_date is None or date < oldest_date):
-            oldest_date = date
+    oldest_date = initial_oldest_date
 
     if oldest_date is None:
         save_history(history_path, history)
@@ -556,6 +565,7 @@ def main() -> None:
 
             if needs_fallback:
                 # Fall back to individual queries for this batch
+                # fetch_auction_prices handles its own pagination when paginate=True
                 for p in batch:
                     slug = p["slug"]
                     team = p["team"]
@@ -564,21 +574,18 @@ def main() -> None:
                     new_auctions = fetch_auction_prices(slug, paginate=args.backfill,
                                                         sleep_seconds=BACKFILL_SLEEP_SECONDS if args.backfill else SLEEP_SECONDS)
                     api_calls += 1
-                    if args.backfill:
-                        rows.append(_backfill_player(slug, team, new_auctions, history_dir))
-                    else:
-                        rows.append(_process_player_results(slug, team, new_auctions, history_dir))
+                    rows.append(_process_player_results(slug, team, new_auctions, history_dir))
             else:
                 # Process batched results
                 for p in batch:
                     slug = p["slug"]
                     team = p["team"]
                     print(f"  {slug}...", end=" ", flush=True)
-                    new_auctions = batch_results[slug]
+                    auctions, raw_count, oldest_date = batch_results[slug]
                     if args.backfill:
-                        rows.append(_backfill_player(slug, team, new_auctions, history_dir))
+                        rows.append(_backfill_player(slug, team, auctions, raw_count, oldest_date, history_dir))
                     else:
-                        rows.append(_process_player_results(slug, team, new_auctions, history_dir))
+                        rows.append(_process_player_results(slug, team, auctions, history_dir))
 
         # Determine max number of price columns across all players in group
         max_prices = max((len(r[2]) for r in rows), default=0)
